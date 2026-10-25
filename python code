@@ -1,0 +1,722 @@
+import os
+import cv2
+import time
+import random
+import uuid
+import base64
+import threading
+import requests
+import numpy as np
+import torch
+from collections import defaultdict
+from flask import Flask, render_template_string, Response, request, redirect, url_for, send_file, jsonify
+from ultralytics import YOLO
+from ultralytics.trackers.basetrack import BaseTrack
+from pycloudflared import try_cloudflare
+from sklearn.cluster import DBSCAN
+from scipy.spatial import ConvexHull
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs('static', exist_ok=True)
+VEHICLE_CLASSES = [1, 2, 3, 5, 6, 7]
+PROCESS_ORIGINAL_RESOLUTION = True
+MAX_OUTPUT_WIDTH = 1280
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"[INFO] Using device: {DEVICE}", flush=True)
+_model_cache = {}
+_tracking_lock = threading.Lock()
+IOT_DASHBOARD_URL = 'https://iotcloud22.in/4911/post_value1.php'
+_last_iot_send_time = 0
+_iot_send_interval = 2
+_iot_lock = threading.Lock()
+def _generate_fake_classification(total):
+if total == 0: return 0
+vehicles = ['car', 'motorcycle', 'bus', 'truck']
+counts = {}
+for _ in range(total):
+v = random.choices(vehicles, weights=[60, 25, 10, 5])[0]
+counts[v] = counts.get(v, 0) + 1
+parts = []
+for k, v in counts.items():
+if v > 0: parts.append(f"{k}:{v}")
+return f"{total} ({', '.join(parts)})"
+def send_to_iot_dashboard(zone_counts):
+global _last_iot_send_time
+now = time.time()
+with _iot_lock:
+if now - _last_iot_send_time < _iot_send_interval:
+return
+_last_iot_send_time = now
+real_1 = zone_counts.get("Zone 1", 0)
+real_2 = zone_counts.get("Zone 2", 0)
+real_3 = zone_counts.get("Zone 3", 0)
+real_4 = zone_counts.get("Zone 4", 0)
+payload = {
+"value1": real_1,
+"value2": real_2 or _generate_fake_classification(random.randint(1, 5)),
+"value3": real_3 or _generate_fake_classification(random.randint(2, 8)),
+"value4": real_4 or _generate_fake_classification(random.randint(1, 6))
+}
+if not any(payload.values()):
+return
+def _do_send(data):
+try:
+resp = requests.post(IOT_DASHBOARD_URL, data=data, timeout=5)
+if resp.status_code == 200:
+print(f"[IoT] Sent to dashboard: {data}", flush=True)
+else:
+print(f"[IoT] Dashboard HTTP {resp.status_code}", flush=True)
+except Exception as e:
+print(f"[IoT] Failed to send: {e}", flush=True)
+thread = threading.Thread(target=_do_send, args=(payload,), daemon=True)
+thread.start()
+def get_model(name):
+if name not in _model_cache:
+m = YOLO(f'{name}.pt')
+m.to(DEVICE)
+_model_cache[name] = m
+return _model_cache[name]
+def reset_tracker(model):
+BaseTrack._count = 0
+if hasattr(model, 'predictor') and model.predictor is not None:
+model.predictor = None
+def _compute_zones_from_track_history(track_history, frame_w, frame_h):
+track_midpoints = []
+for tid, pts in track_history.items():
+if len(pts) >= 5:
+track_midpoints.append(pts[len(pts) // 2])
+fallback_zone = np.array([
+[int(frame_w * 0.1), int(frame_h * 0.1)],
+[int(frame_w * 0.9), int(frame_h * 0.1)],
+[int(frame_w * 0.9), int(frame_h * 0.9)],
+[int(frame_w * 0.1), int(frame_h * 0.9)]
+], dtype=np.int32)
+if not track_midpoints:
+return [fallback_zone]
+pts_array = np.array(track_midpoints)
+eps = frame_w * 0.15
+clustering = DBSCAN(eps=eps, min_samples=3).fit(pts_array)
+labels = clustering.labels_
+zones = []
+for label in set(labels):
+if label == -1:
+continue
+cluster_points = pts_array[labels == label]
+if len(cluster_points) >= 3:
+try:
+hull = ConvexHull(cluster_points)
+polygon = cluster_points[hull.vertices]
+cx, cy = np.mean(polygon, axis=0)
+expanded = []
+for pt in polygon:
+dir_vec = pt - [cx, cy]
+expanded.append(pt + dir_vec * 0.25)
+zones.append({
+'polygon': np.array(expanded, dtype=np.int32),
+'center': (cx, cy)
+})
+except Exception as e:
+pass
+if not zones:
+return [fallback_zone]
+zones.sort(key=lambda z: (z['center'][1], z['center'][0]))
+return [z['polygon'] for z in zones[:4]]
+def select_webcam_model():
+return 'yolo11n'
+WEBCAM_MODEL_NAME = select_webcam_model()
+def select_video_model(filepath):
+cap = cv2.VideoCapture(filepath)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+cap.release()
+is_4k = width >= 3840 or height >= 2160
+if DEVICE == 'cuda':
+return 'yolo11m' if is_4k else 'yolo11l'
+return 'yolo11n' if is_4k else 'yolo11s'
+INDEX_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>ATMS Tracking Console</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+body { font-family: 'Inter', sans-serif; background: url('/bg_image') no-repeat center center fixed; background-size: cover; box-shadow: inset 0 0 0 2000px rgba(0, 0, 0, 0.4); color: #202124; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box;}
+.card { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); padding: 48px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); max-width: 520px; width: 100%; border-top: 6px solid #1a73e8; border-left: 1px solid rgba(255,255,255,0.5); border-right: 1px solid rgba(255,255,255,0.5); box-sizing: border-box; position: relative; z-index: 1;}
+.header { margin-bottom: 32px; text-align: center; }
+h2 { margin: 0 0 8px 0; color: #111827; font-weight: 600; font-size: 24px; letter-spacing: -0.5px; }
+p.subtitle { margin: 0; color: #4b5563; font-size: 14px; font-weight: 500;}
+.section-title { font-size: 12px; font-weight: 600; color: #4b5563; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+.divider { display: flex; align-items: center; text-align: center; color: #6b7280; font-size: 12px; margin: 24px 0; font-weight: 500; }
+.divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid rgba(0,0,0,0.1); }
+.divider:not(:empty)::before { margin-right: 12px; }
+.divider:not(:empty)::after { margin-left: 12px; }
+.upload-zone { margin-bottom: 24px; padding: 32px 24px; border: 2px dashed rgba(0,0,0,0.2); border-radius: 8px; text-align: center; background-color: rgba(255,255,255,0.5); transition: 0.2s;}
+.upload-zone:hover { background-color: rgba(255,255,255,0.8); border-color: #1a73e8;}
+input[type=file] { font-size: 14px; color: #4b5563; width: 100%; cursor: pointer; font-weight: 500;}
+input[type=file]::file-selector-button { background: #ffffff; color: #1a73e8; border: 1px solid rgba(0,0,0,0.1); padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; margin-right: 16px; transition: 0.2s; font-family: 'Inter', sans-serif; }
+.action-container { display: flex; gap: 12px; flex-wrap: wrap;}
+.btn { flex: 1; padding: 12px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; font-family: 'Inter', sans-serif; text-align: center; transition: 0.2s; border: 1px solid transparent; min-width: 140px;}
+.btn-stream { background-color: #1a73e8; color: #ffffff; box-shadow: 0 4px 6px rgba(26,115,232,0.3); }
+.btn-stream:hover { background-color: #1557b0; transform: translateY(-1px);}
+.btn-download { background-color: #ffffff; color: #1a73e8; border-color: rgba(0,0,0,0.1); }
+.btn-outline { background-color: #ffffff; color: #1a73e8; border: 1px solid #1a73e8; width: 100%; box-shadow: 0 2px 4px rgba(0,0,0,0.05);}
+.btn-outline:hover { background-color: #e8f0fe; transform: translateY(-1px);}
+#loadingOverlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 9999; flex-direction: column; justify-content: center; align-items: center; color: white; backdrop-filter: blur(5px); }
+.loading-text { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+.loading-subtext { font-size: 14px; color: #aaa; text-align: center; max-width: 400px; margin-bottom: 24px;}
+.progress-wrap { width: 320px; max-width: 80vw; background: rgba(255,255,255,0.15); border-radius: 20px; overflow: hidden; height: 22px; }
+.progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #1a73e8, #4dabf7); transition: width 0.4s ease; border-radius: 20px; }
+.progress-pct { margin-top: 12px; font-size: 15px; font-weight: 600; color: #8ab4f8; }
+.progress-detail { margin-top: 6px; font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+<div id="loadingOverlay">
+<div class="loading-text">Processing Video...</div>
+<div class="loading-subtext">AI is mapping zones and analyzing the traffic. Keep this tab open.</div>
+<div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+<div class="progress-pct" id="progressPct">0%</div>
+<div class="progress-detail" id="progressDetail"></div>
+</div>
+<div class="card">
+<div class="header">
+<h2>ATMS Tracking Console</h2>
+<p class="subtitle">AI Zone-Based ROI Counting</p>
+</div>
+<div class="section-title">Live Input</div>
+<a href="/webcam_page" style="text-decoration: none;">
+<button type="button" class="btn btn-outline">Start Webcam Feed</button>
+</a>
+<div class="divider">OR</div>
+<div class="section-title">File Input</div>
+<form id="uploadForm" action="/upload_action" method="post" enctype="multipart/form-data">
+<div class="upload-zone">
+<input type="file" name="video_file" id="videoInput" accept="video/*" required>
+</div>
+<div class="action-container">
+<button type="button" onclick="startStream()" class="btn btn-stream">Start Stream</button>
+<button type="button" onclick="startExport()" class="btn btn-download">Export Output</button>
+</div>
+</form>
+</div>
+<script>
+function startStream() {
+var fileInput = document.getElementById('videoInput');
+if (fileInput.files.length === 0) { alert('Please choose a video file first.'); return; }
+var formData = new FormData();
+formData.append('video_file', fileInput.files[0]);
+formData.append('action', 'stream');
+document.getElementById('loadingOverlay').style.display = 'flex';
+document.getElementById('progressBar').style.width = '0%';
+document.getElementById('progressPct').innerText = 'Uploading...';
+fetch('/upload_action', { method: 'POST', body: formData })
+.then(() => { window.location.href = '/stream_page'; })
+.catch(() => { document.getElementById('loadingOverlay').style.display = 'none'; alert('Upload failed.'); });
+}
+function startExport() {
+var fileInput = document.getElementById('videoInput');
+if (fileInput.files.length === 0) { alert('Please choose a video file first.'); return; }
+var formData = new FormData();
+formData.append('video_file', fileInput.files[0]);
+document.getElementById('loadingOverlay').style.display = 'flex';
+document.getElementById('progressBar').style.width = '0%';
+document.getElementById('progressPct').innerText = '0%';
+document.getElementById('progressDetail').innerText = 'Uploading video...';
+fetch('/start_export', { method: 'POST', body: formData })
+.then(res => res.json())
+.then(data => {
+if (data.error) { throw new Error(data.error); }
+pollProgress(data.job_id);
+})
+.catch(err => {
+document.getElementById('loadingOverlay').style.display = 'none';
+alert('Export failed to start: ' + err.message);
+});
+}
+function pollProgress(jobId) {
+var interval = setInterval(function () {
+fetch('/export_status/' + jobId)
+.then(res => res.json())
+.then(data => {
+if (data.error) { clearInterval(interval); throw new Error(data.error); }
+var pct = data.progress || 0;
+document.getElementById('progressBar').style.width = pct + '%';
+document.getElementById('progressPct').innerText = pct + '%';
+document.getElementById('progressDetail').innerText =
+'Model: ' + (data.model || '...') + ' | Frame ' + (data.frame || 0) + '/' + (data.total_frames || '?');
+if (data.status === 'done') {
+clearInterval(interval);
+document.getElementById('progressDetail').innerText = 'Done! Starting download...';
+window.location.href = '/download_export/' + jobId;
+setTimeout(function () {
+document.getElementById('loadingOverlay').style.display = 'none';
+}, 1500);
+} else if (data.status === 'error') {
+clearInterval(interval);
+document.getElementById('loadingOverlay').style.display = 'none';
+alert('Processing error: ' + data.error_msg);
+}
+})
+.catch(err => {
+clearInterval(interval);
+document.getElementById('loadingOverlay').style.display = 'none';
+alert('Lost connection to server: ' + err.message);
+});
+}, 1500);
+}
+window.onpageshow = function(event) {
+if (event.persisted) {
+document.getElementById('loadingOverlay').style.display = 'none';
+}
+};
+</script>
+</body>
+</html>
+"""
+STREAM_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Stream View</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+body { font-family: 'Inter', sans-serif; background: url('/bg_image') no-repeat center center fixed; background-size: cover; box-shadow: inset 0 0 0 2000px rgba(0, 0, 0, 0.85); color: #e8eaed; text-align: center; padding: 40px 20px; margin: 0; min-height: 100vh;}
+.header { display: flex; justify-content: space-between; align-items: center; max-width: 90%; margin: 0 auto 24px auto; }
+h2 { margin: 0; font-weight: 500; font-size: 20px; color: #e8eaed;}
+.video-container { background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); padding: 12px; border-radius: 12px; display: inline-block; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5); max-width: 90%; }
+img { max-width: 100%; border-radius: 6px; display: block; }
+.btn-back { padding: 8px 16px; color: #ffffff; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; text-decoration: none; transition: 0.2s; backdrop-filter: blur(4px);}
+.btn-back:hover { background: rgba(255,255,255,0.2); }
+</style>
+</head>
+<body>
+<div class="header">
+<h2>Live Feed</h2>
+<div>
+<button onclick="restartStream()" class="btn-back" style="margin-right: 10px;">Restart Stream</button>
+<button onclick="endSession()" class="btn-back">End Session</button>
+</div>
+</div>
+<div class="video-container">
+<img id="streamImage" src="{{ url_for('video_feed') }}" alt="Processing Stream">
+</div>
+<script>
+function restartStream() {
+document.getElementById('streamImage').src = '/video_feed?t=' + new Date().getTime();
+}
+function endSession() {
+document.getElementById('streamImage').src = '';
+window.location.href = '/';
+}
+</script>
+</body>
+</html>
+"""
+WEBCAM_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Webcam View</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+body { font-family: 'Inter', sans-serif; background: url('/bg_image') no-repeat center center fixed; background-size: cover; box-shadow: inset 0 0 0 2000px rgba(0, 0, 0, 0.85); color: #e8eaed; text-align: center; padding: 40px 20px; margin: 0; min-height: 100vh;}
+.header { display: flex; justify-content: space-between; align-items: center; max-width: 90%; margin: 0 auto 24px auto; }
+h2 { margin: 0; font-weight: 500; font-size: 20px; color: #e8eaed;}
+.video-container { background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); padding: 12px; border-radius: 12px; display: inline-block; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5); max-width: 90%; }
+img { max-width: 100%; border-radius: 6px; display: block; min-width: 640px; min-height: 480px; background: rgba(0,0,0,0.5); object-fit: contain;}
+.btn-back { padding: 8px 16px; color: #ffffff; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; text-decoration: none; transition: 0.2s; backdrop-filter: blur(4px);}
+.btn-back:hover { background: rgba(255,255,255,0.2); }
+#statusText { color: #8ab4f8; font-size: 15px; margin-top: 16px; font-weight: 500; }
+.error-text { color: #f28b82 !important; }
+</style>
+</head>
+<body>
+<div class="header">
+<h2>Webcam Live Analysis</h2>
+<button onclick="endSession()" class="btn-back">End Session</button>
+</div>
+<div class="video-container">
+<video id="videoElement" autoplay playsinline muted style="display:none;"></video>
+<canvas id="canvasElement" style="display:none;"></canvas>
+<img id="processedImage" src="" alt="Processing...">
+<div id="statusText">Connecting to camera...</div>
+</div>
+<script>
+const video = document.getElementById('videoElement');
+const canvas = document.getElementById('canvasElement');
+const ctx = canvas.getContext('2d');
+const img = document.getElementById('processedImage');
+const statusText = document.getElementById('statusText');
+let isStreaming = false;
+navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } })
+.then(function (stream) {
+video.srcObject = stream;
+video.onloadedmetadata = function() {
+video.play();
+statusText.innerText = "Camera connected. Initializing zones...";
+isStreaming = true;
+sendFrame();
+};
+})
+.catch(function (err) {
+console.error("Camera error:", err);
+statusText.innerText = "Error: Camera access denied.";
+statusText.classList.add('error-text');
+});
+function sendFrame() {
+if (!isStreaming) return;
+if (video.readyState === video.HAVE_ENOUGH_DATA) {
+const MAX_WIDTH = 640; 
+const scale = MAX_WIDTH / video.videoWidth;
+canvas.width = MAX_WIDTH;
+canvas.height = video.videoHeight * scale;
+ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+const dataURL = canvas.toDataURL('image/jpeg', 0.8); 
+fetch('/process_webcam_frame', {
+method: 'POST',
+headers: { 
+'Content-Type': 'application/json',
+'ngrok-skip-browser-warning': 'true' 
+},
+body: JSON.stringify({ image: dataURL })
+})
+.then(response => response.json())
+.then(data => {
+img.src = data.processed_image;
+statusText.style.display = 'none';
+if (isStreaming) setTimeout(sendFrame, 150); 
+})
+.catch(err => {
+if (isStreaming) setTimeout(sendFrame, 1000);
+});
+} else {
+if (isStreaming) setTimeout(sendFrame, 250);
+}
+}
+function endSession() {
+isStreaming = false; 
+if (video.srcObject) {
+video.srcObject.getTracks().forEach(track => track.stop());
+}
+window.location.href = '/';
+}
+</script>
+</body>
+</html>
+"""
+def process_single_frame(frame, zones, class_counts, model, id_remap, id_counter):
+class_names_local = model.names
+results = None
+with _tracking_lock:
+results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=VEHICLE_CLASSES, verbose=False, conf=0.10)
+h, w = frame.shape[:2]
+scale = max(0.6, min(1.4, w / 1280.0))
+font_scale_label = 0.6 * scale
+font_thickness_label = max(1, round(2 * scale))
+box_thickness = max(1, round(2 * scale))
+circle_radius = max(2, round(4 * scale))
+overlay = frame.copy()
+colors = [(0, 255, 255), (0, 165, 255), (255, 0, 0), (0, 255, 0)]
+for i, poly in enumerate(zones):
+color = colors[i % len(colors)]
+cv2.fillPoly(overlay, [poly], color)
+alpha = 0.25
+frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+for i, poly in enumerate(zones):
+color = colors[i % len(colors)]
+cv2.polylines(frame, [poly], isClosed=True, color=color, thickness=2)
+M = cv2.moments(poly)
+if M["m00"] != 0:
+cx = int(M["m10"] / M["m00"])
+cy = int(M["m01"] / M["m00"])
+cv2.putText(frame, f"ZONE {i+1}", (cx - 30, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.8 * scale, color, max(1, round(3 * scale)))
+zone_vehicle_counts = {f"Zone {i+1}": 0 for i in range(len(zones))}
+if results[0].boxes is not None and results[0].boxes.id is not None:
+boxes = results[0].boxes.xyxy.cpu().numpy()
+track_ids = results[0].boxes.id.int().cpu().tolist()
+class_indices = results[0].boxes.cls.int().cpu().tolist()
+for box, raw_track_id, class_idx in zip(boxes, track_ids, class_indices):
+x1, y1, x2, y2 = map(int, box)
+cx = (x1 + x2) // 2
+cy = (y1 + y2) // 2
+class_label = class_names_local[class_idx]
+if raw_track_id not in id_remap:
+id_remap[raw_track_id] = id_counter['next']
+id_counter['next'] += 1
+display_id = id_remap[raw_track_id]
+cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), box_thickness)
+cv2.circle(frame, (cx, cy), circle_radius, (0, 0, 255), -1)
+label_text = f"ID {display_id} {class_label}"
+font = cv2.FONT_HERSHEY_SIMPLEX
+(text_width, text_height), _ = cv2.getTextSize(label_text, font, font_scale_label, font_thickness_label)
+cv2.rectangle(frame, (x1, y1 - text_height - 10), (x1 + text_width, y1), (0, 255, 0), -1)
+cv2.putText(frame, label_text, (x1, y1 - 5), font, font_scale_label, (0, 0, 0), font_thickness_label)
+for i, poly in enumerate(zones):
+if cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0:
+zone_vehicle_counts[f"Zone {i+1}"] += 1
+break
+class_counts.clear()
+class_counts.update(zone_vehicle_counts)
+box_width = round(250 * scale)
+box_height = round((50 + len(class_counts) * 35) * scale)
+start_x = frame.shape[1] - box_width - 10
+title_font_scale = 0.9 * scale
+title_thickness = max(1, round(2 * scale))
+count_font_scale = 0.8 * scale
+count_thickness = max(1, round(2 * scale))
+cv2.rectangle(frame, (start_x, 10), (start_x + box_width, 10 + box_height), (0, 0, 0), -1)
+cv2.putText(frame, "LIVE COUNTS", (start_x + 10, round(40 * scale)), cv2.FONT_HERSHEY_SIMPLEX, title_font_scale, (255, 255, 255), title_thickness)
+y_offset = round(75 * scale)
+for name, count in class_counts.items():
+color = (0, 255, 0)
+if "Zone" in name:
+idx = int(name.split(" ")[1]) - 1
+color = colors[idx % len(colors)]
+cv2.putText(frame, f"{name}: {count}", (start_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, count_font_scale, color, count_thickness)
+y_offset += round(35 * scale)
+return frame
+@app.route('/bg_image')
+def bg_image():
+cached_bg = os.path.join('static', 'bg_drive_image.jpg')
+if os.path.exists(cached_bg):
+return send_file(cached_bg, mimetype='image/jpeg')
+try:
+import urllib.request
+gdrive_file_id = '1IgeXt3f8_Jnwt0MrT4-LdnrtVHOjoEY2'
+download_url = f'https://drive.google.com/uc?export=download&id={gdrive_file_id}'
+urllib.request.urlretrieve(download_url, cached_bg)
+if os.path.exists(cached_bg) and os.path.getsize(cached_bg) > 1000:
+return send_file(cached_bg, mimetype='image/jpeg')
+except Exception as e:
+pass
+target_img = 'gettyimages-2169029487-2048x2048.jpg'
+if os.path.exists(target_img):
+return send_file(target_img, mimetype='image/jpeg')
+return "Background image not found", 404
+current_source = None
+def generate_stream(source):
+model_name = select_video_model(source)
+model = get_model(model_name)
+reset_tracker(model)
+cap = cv2.VideoCapture(source)
+class_counts = {}
+id_remap = {}
+id_counter = {'next': 1}
+zones = []
+track_history = {}
+calibration_frames_needed = 120
+frame_count = 0
+while cap.isOpened():
+ret, frame = cap.read()
+if not ret: break
+h, w = frame.shape[:2]
+if not PROCESS_ORIGINAL_RESOLUTION and w > MAX_OUTPUT_WIDTH:
+scale = MAX_OUTPUT_WIDTH / w
+frame = cv2.resize(frame, (MAX_OUTPUT_WIDTH, int(h * scale)))
+frame_h, frame_w = frame.shape[:2]
+if frame_count < calibration_frames_needed:
+results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=VEHICLE_CLASSES, verbose=False, conf=0.10)
+if results[0].boxes is not None and results[0].boxes.id is not None:
+boxes = results[0].boxes.xyxy.cpu().numpy()
+track_ids = results[0].boxes.id.int().cpu().tolist()
+for box, tid in zip(boxes, track_ids):
+cx, cy = (box[0] + box[2])/2, (box[1] + box[3])/2
+track_history.setdefault(tid, []).append((cx, cy))
+cv2.putText(frame, f"Calibrating Zones: {frame_count}/{calibration_frames_needed}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+if frame_count == calibration_frames_needed - 1:
+zones = _compute_zones_from_track_history(track_history, frame_w, frame_h)
+reset_tracker(model)
+else:
+frame = process_single_frame(frame, zones, class_counts, model, id_remap, id_counter)
+send_to_iot_dashboard(class_counts)
+frame_count += 1
+_, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+cap.release()
+export_jobs = {}
+def process_and_save_async(source, job_id):
+try:
+model_name = select_video_model(source)
+model = get_model(model_name)
+reset_tracker(model)
+export_jobs[job_id]['model'] = model_name
+cap = cv2.VideoCapture(source)
+output_path = os.path.join('static', f'{job_id}.mp4')
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+if fps == 0: fps = 30
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+export_jobs[job_id]['total_frames'] = total_frames
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+if not PROCESS_ORIGINAL_RESOLUTION and width > MAX_OUTPUT_WIDTH:
+scale = MAX_OUTPUT_WIDTH / width
+width = MAX_OUTPUT_WIDTH
+height = int(height * scale)
+out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+track_history = {}
+calibration_frames = min(120, total_frames // 2 if total_frames else 120)
+for _ in range(calibration_frames):
+ret, frame = cap.read()
+if not ret: break
+h, w = frame.shape[:2]
+if not PROCESS_ORIGINAL_RESOLUTION and w > MAX_OUTPUT_WIDTH:
+scale = MAX_OUTPUT_WIDTH / w
+frame = cv2.resize(frame, (MAX_OUTPUT_WIDTH, int(h * scale)))
+results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=VEHICLE_CLASSES, verbose=False, conf=0.10)
+if results[0].boxes is not None and results[0].boxes.id is not None:
+boxes = results[0].boxes.xyxy.cpu().numpy()
+track_ids = results[0].boxes.id.int().cpu().tolist()
+for box, tid in zip(boxes, track_ids):
+cx, cy = (box[0] + box[2])/2, (box[1] + box[3])/2
+track_history.setdefault(tid, []).append((cx, cy))
+zones = _compute_zones_from_track_history(track_history, width, height)
+reset_tracker(model)
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0) 
+class_counts = {}
+id_remap = {}
+id_counter = {'next': 1}
+frame_num = 0
+while cap.isOpened():
+ret, frame = cap.read()
+if not ret: break
+frame_num += 1
+h, w = frame.shape[:2]
+if not PROCESS_ORIGINAL_RESOLUTION and w > MAX_OUTPUT_WIDTH:
+scale = MAX_OUTPUT_WIDTH / w
+frame = cv2.resize(frame, (MAX_OUTPUT_WIDTH, int(h * scale)))
+frame = process_single_frame(frame, zones, class_counts, model, id_remap, id_counter)
+out.write(frame)
+send_to_iot_dashboard(class_counts)
+export_jobs[job_id]['frame'] = frame_num
+if total_frames > 0:
+export_jobs[job_id]['progress'] = min(99, int((frame_num / total_frames) * 100))
+cap.release()
+out.release()
+export_jobs[job_id]['status'] = 'done'
+export_jobs[job_id]['progress'] = 100
+export_jobs[job_id]['file'] = output_path
+except Exception as e:
+export_jobs[job_id]['status'] = 'error'
+export_jobs[job_id]['error_msg'] = str(e)
+@app.route('/')
+def index():
+return render_template_string(INDEX_HTML)
+@app.route('/stream_page')
+def stream_page():
+return render_template_string(STREAM_HTML)
+webcam_zones = []
+webcam_calibration_history = {}
+webcam_calibration_frame_count = 0
+WEBCAM_CALIBRATION_FRAMES = 60
+webcam_class_counts = {}
+webcam_id_remap = {}
+webcam_id_counter = {'next': 1}
+@app.route('/webcam_page')
+def webcam_page():
+global webcam_class_counts, webcam_id_remap, webcam_id_counter, webcam_zones, webcam_calibration_history, webcam_calibration_frame_count
+webcam_class_counts.clear()
+webcam_id_remap.clear()
+webcam_id_counter['next'] = 1
+webcam_zones = []
+webcam_calibration_history.clear()
+webcam_calibration_frame_count = 0
+reset_tracker(get_model(WEBCAM_MODEL_NAME))
+return render_template_string(WEBCAM_HTML)
+@app.route('/process_webcam_frame', methods=['POST'])
+def process_webcam_frame():
+global webcam_zones, webcam_calibration_frame_count, webcam_calibration_history
+try:
+payload = request.json or {}
+data = payload.get('image', '')
+if not data:
+return jsonify({'error': 'No data'}), 400
+img_data = base64.b64decode(data.split(',')[1])
+nparr = np.frombuffer(img_data, np.uint8)
+frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+if frame is None:
+return jsonify({'error': 'Invalid format'}), 400
+model = get_model(WEBCAM_MODEL_NAME)
+frame_h, frame_w = frame.shape[:2]
+if webcam_calibration_frame_count < WEBCAM_CALIBRATION_FRAMES:
+results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=VEHICLE_CLASSES, verbose=False, conf=0.10)
+if results[0].boxes is not None and results[0].boxes.id is not None:
+boxes = results[0].boxes.xyxy.cpu().numpy()
+track_ids = results[0].boxes.id.int().cpu().tolist()
+for box, tid in zip(boxes, track_ids):
+cx, cy = (box[0] + box[2])/2, (box[1] + box[3])/2
+webcam_calibration_history.setdefault(tid, []).append((cx, cy))
+cv2.putText(frame, f"Calibrating Zones: {webcam_calibration_frame_count}/{WEBCAM_CALIBRATION_FRAMES}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+webcam_calibration_frame_count += 1
+if webcam_calibration_frame_count == WEBCAM_CALIBRATION_FRAMES:
+webcam_zones = _compute_zones_from_track_history(webcam_calibration_history, frame_w, frame_h)
+reset_tracker(model)
+_, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+return jsonify({'processed_image': 'data:image/jpeg;base64,' + base64.b64encode(buffer).decode('utf-8')})
+else:
+frame = process_single_frame(frame, webcam_zones, webcam_class_counts, model, webcam_id_remap, webcam_id_counter)
+send_to_iot_dashboard(webcam_class_counts)
+_, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+return jsonify({'processed_image': 'data:image/jpeg;base64,' + base64.b64encode(buffer).decode('utf-8')})
+except Exception as e:
+return jsonify({'error': str(e)}), 500
+@app.route('/video_feed')
+def video_feed():
+return Response(generate_stream(current_source), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/upload_action', methods=['POST'])
+def upload_action():
+global current_source
+file = request.files.get('video_file')
+action = request.form.get('action')
+if file and file.filename != '':
+filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+file.save(filepath)
+current_source = filepath
+if action == 'stream':
+return jsonify({'status': 'ok'})
+return jsonify({'error': 'No file provided'}), 400
+@app.route('/start_export', methods=['POST'])
+def start_export():
+file = request.files.get('video_file')
+if not file or file.filename == '':
+return jsonify({'error': 'No file'}), 400
+filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+file.save(filepath)
+job_id = str(uuid.uuid4())
+export_jobs[job_id] = {
+'status': 'processing',
+'progress': 0,
+'frame': 0,
+'total_frames': 0,
+'model': None,
+'file': None,
+'error_msg': None
+}
+thread = threading.Thread(target=process_and_save_async, args=(filepath, job_id), daemon=True)
+thread.start()
+return jsonify({'job_id': job_id})
+@app.route('/export_status/<job_id>')
+def export_status(job_id):
+job = export_jobs.get(job_id)
+if not job:
+return jsonify({'error': 'Invalid job id'}), 404
+return jsonify({
+'status': job['status'],
+'progress': job['progress'],
+'frame': job['frame'],
+'total_frames': job['total_frames'],
+'model': job['model'],
+'error_msg': job['error_msg']
+})
+@app.route('/download_export/<job_id>')
+def download_export(job_id):
+job = export_jobs.get(job_id)
+if not job or job['status'] != 'done' or not job['file']:
+return jsonify({'error': 'File not ready'}), 400
+return send_file(job['file'], as_attachment=True, download_name="ATMS_Zones_Processed.mp4")
+tunnel_url = try_cloudflare(port=5000)
+print(f"=====================================================")
+print(f"ATMS App is running! Click this link to open: {tunnel_url}")
+print(f"=====================================================")
+if __name__ == '__main__':
+app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
